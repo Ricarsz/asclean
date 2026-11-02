@@ -5,7 +5,8 @@
 一个终端界面，用来查看、筛选和删除本机 AI 编码客户端留下的会话与工作区：
 
 - **DeepSeek Harness**（`~/.dsh`）
-- **Codex**（`~/.codex`，含 `CODEX_HOME` 形式的独立实例）
+- **Codex**（`~/.codex`，`sessions/` 下的 rollout 文件与新版 `state_<n>.sqlite`
+  里的会话题都算，含 `CODEX_HOME` 形式的独立实例）
 - **Opencode**（`~/.local/share/opencode/opencode.db`）
 
 会话按「工作区 → 会话」的树形排在一个视图里：工作区标题行显示会话数、总大小和最近更新，

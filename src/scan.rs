@@ -1,7 +1,8 @@
 //! 扫描本机的会话存储：
 //!
 //! - DeepSeek Harness：`~/.dsh*/sessions/<slug>/session-<uuid>/session*.jsonl.zstd`
-//! - Codex：`~/.codex*/sessions/YYYY/MM/DD/rollout-*.jsonl`
+//! - Codex：`~/.codex*/sessions/YYYY/MM/DD/rollout-*.jsonl`，以及新版本
+//!   `~/.codex*/state_<n>.sqlite` 里的会话记录（见 [`crate::codex`]）
 //! - Opencode：`~/.local/share/opencode/opencode.db`（SQLite）
 //!
 //! 目录位置可由 `SESSTUI_DSH_ROOT` / `SESSTUI_CODEX_HOME` / `SESSTUI_OPENCODE_DIR`
@@ -62,6 +63,11 @@ fn env_roots(name: &str) -> Vec<PathBuf> {
 
 /// `$HOME` 下所有名字形如 `<prefix>*` 且包含 `sessions/` 的目录。
 fn sibling_roots(prefix: &str) -> Vec<PathBuf> {
+    sibling_roots_where(prefix, |path| path.join("sessions").is_dir())
+}
+
+/// 同上，目录是否算一个实例由 `keep` 决定（Codex 新版本可能没有 `sessions/`）。
+fn sibling_roots_where(prefix: &str, keep: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(home()) else {
         return Vec::new();
     };
@@ -69,10 +75,15 @@ fn sibling_roots(prefix: &str) -> Vec<PathBuf> {
         .flatten()
         .filter(|entry| entry.file_name().to_string_lossy().starts_with(prefix))
         .map(|entry| entry.path())
-        .filter(|path| path.is_dir() && path.join("sessions").is_dir())
+        .filter(|path| path.is_dir() && keep(path))
         .collect();
     found.sort();
     found
+}
+
+/// Codex 实例：有 rollout 目录，或者新版本的会话库。
+fn codex_root(path: &Path) -> bool {
+    path.join("sessions").is_dir() || crate::codex::find_state_db(path).is_some()
 }
 
 pub fn scan() -> Snapshot {
@@ -596,7 +607,7 @@ impl Read for ZstdReader {
 fn scan_codex(snapshot: &mut Snapshot) {
     let mut roots = env_roots("SESSTUI_CODEX_HOME");
     if roots.is_empty() {
-        roots = sibling_roots(".codex");
+        roots = sibling_roots_where(".codex", codex_root);
     }
     for root in roots {
         let mut root_info = Root {
@@ -609,9 +620,11 @@ fn scan_codex(snapshot: &mut Snapshot) {
         let mut files = Vec::new();
         collect_rollouts(&root.join("sessions"), 0, &mut files);
         files.sort();
+        let mut seen = HashSet::new();
         for file in files {
             match load_codex_session(&file, &root, &titles) {
                 Ok(session) => {
+                    seen.insert(session.id.clone());
                     root_info.sessions += 1;
                     snapshot.sessions.push(session);
                 }
@@ -620,7 +633,92 @@ fn scan_codex(snapshot: &mut Snapshot) {
                     .push(format!("{}：{error}", file.display())),
             }
         }
+        // 新版本把会话搬进了 SQLite；同一会话已有 rollout 文件时以文件为准。
+        match crate::codex::load_threads(&root) {
+            Ok(threads) => {
+                for thread in threads {
+                    if !seen.insert(thread.id.clone()) {
+                        continue;
+                    }
+                    root_info.sessions += 1;
+                    snapshot
+                        .sessions
+                        .push(codex_thread_session(thread, &root, &titles));
+                }
+            }
+            Err(error) => snapshot.warnings.push(format!(
+                "{}：读取 Codex 会话库失败：{error:#}",
+                root.display()
+            )),
+        }
         snapshot.roots.push(root_info);
+    }
+}
+
+/// 把 `threads` 表里的一行映射成统一的会话视图。
+fn codex_thread_session(
+    thread: crate::codex::Thread,
+    root: &Path,
+    titles: &HashMap<String, String>,
+) -> Session {
+    let preview = if thread.preview.trim().is_empty() {
+        String::new()
+    } else {
+        let text = util::one_line(&thread.preview);
+        if looks_like_injection(&text) {
+            String::new()
+        } else {
+            util::truncate(&text, 160)
+        }
+    };
+    let mut title = {
+        let raw = thread.title.trim();
+        if !raw.is_empty() {
+            util::truncate(&util::one_line(raw), 60)
+        } else if let Some(title) = titles.get(&thread.id) {
+            title.clone()
+        } else if preview.is_empty() {
+            "(无标题)".to_string()
+        } else {
+            util::truncate(&preview, 60)
+        }
+    };
+    if thread.archived {
+        title = format!("{title}（已归档）");
+    }
+    let cwd = if thread.cwd.trim().is_empty() {
+        None
+    } else {
+        Some(thread.cwd.clone())
+    };
+    let workspace = cwd
+        .as_ref()
+        .map(|cwd| Workspace::from_path(Client::Codex, cwd.clone(), root.to_path_buf()));
+    // rollout 文件可能已经被清理，路径只用来定位与去重，删除时走会话库。
+    let path = if thread.rollout.as_os_str().is_empty() {
+        root.join("sessions")
+            .join(format!("rollout-{}.jsonl", thread.id))
+    } else {
+        thread.rollout
+    };
+    Session {
+        client: Client::Codex,
+        id: thread.id,
+        title,
+        preview,
+        path,
+        root: root.to_path_buf(),
+        cwd,
+        workspace,
+        created: thread.created_ms.and_then(util::system_time_from_millis),
+        updated: thread.updated_ms.and_then(util::system_time_from_millis),
+        bytes: thread.bytes,
+        messages: thread.messages,
+        tokens: None,
+        cost: None,
+        locked: false,
+        bili: None,
+        magic: None,
     }
 }
 

@@ -745,6 +745,12 @@ fn doctor() -> Result<()> {
             root.path.display(),
             if writable { "是" } else { "否" }
         );
+        if root.client == Client::Codex {
+            match crate::codex::find_state_db(&root.path) {
+                Some(db) => println!("        会话库：{}", db.display()),
+                None => println!("        会话库：未找到 state_*.sqlite（只会扫 rollout 文件）"),
+            }
+        }
     }
     for warning in &snapshot.warnings {
         println!("  警告：{warning}");

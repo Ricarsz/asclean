@@ -115,21 +115,32 @@ fn delete_dsh(session: &Session) -> Result<Outcome> {
 }
 
 fn delete_codex(session: &Session) -> Result<Outcome> {
+    let mut bytes = 0;
+    let mut removed = false;
+    // 老版本只有 rollout 文件；新版本的会话正文在 SQLite 里，文件可能不存在。
     let file = &session.path;
-    let allowed = session.root.join("sessions");
-    ensure_inside(file, &allowed)?;
-    if !file
-        .file_name()
-        .map(|name| {
-            let name = name.to_string_lossy();
-            name.starts_with("rollout-") && name.ends_with(".jsonl")
-        })
-        .unwrap_or(false)
-    {
-        bail!("不是 rollout 文件：{}", file.display());
+    if let Ok(meta) = fs::metadata(file) {
+        ensure_inside(file, &session.root.join("sessions"))?;
+        if !file
+            .file_name()
+            .map(|name| {
+                let name = name.to_string_lossy();
+                name.starts_with("rollout-") && name.ends_with(".jsonl")
+            })
+            .unwrap_or(false)
+        {
+            bail!("不是 rollout 文件：{}", file.display());
+        }
+        bytes += meta.len();
+        fs::remove_file(file).with_context(|| format!("删除 {}", file.display()))?;
+        removed = true;
     }
-    let bytes = fs::metadata(file).map(|meta| meta.len()).unwrap_or(0);
-    fs::remove_file(file).with_context(|| format!("删除 {}", file.display()))?;
+    let threads = crate::codex::delete_thread(&session.root, &session.id)?;
+    bytes += threads.bytes;
+    removed |= threads.rows > 0;
+    if !removed {
+        bail!("没有找到该会话的存储（rollout 文件与 Codex 会话库都没有）");
+    }
     drop_codex_index(&session.root.join("session_index.jsonl"), &session.id)?;
     Ok(Outcome {
         bytes,
@@ -538,6 +549,135 @@ mod tests {
             }),
             magic: None,
         }
+    }
+
+    /// Codex 新版本：会话在 `state_5.sqlite` / `thread_history_1.sqlite` 里。
+    fn codex_db_fixture(scratch: &Scratch) -> PathBuf {
+        let root = scratch.path().join("codex");
+        fs::create_dir_all(root.join("sessions")).expect("建目录");
+        let state = Connection::open(root.join("state_5.sqlite")).expect("建 state 库");
+        state
+            .execute_batch(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, rollout_path TEXT NOT NULL,
+                    cwd TEXT NOT NULL, title TEXT NOT NULL, created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL);
+                 INSERT INTO threads VALUES ('target-id', '/tmp/gone.jsonl', '/work',
+                    'target', 1700000000, 1700000100);
+                 INSERT INTO threads VALUES ('keep-id', '/tmp/keep.jsonl', '/work',
+                    'keep', 1700000000, 1700000100);",
+            )
+            .expect("建表");
+        let history = Connection::open(root.join("thread_history_1.sqlite")).expect("建历史库");
+        history
+            .execute_batch(
+                "CREATE TABLE thread_items (thread_id TEXT NOT NULL, turn_id TEXT NOT NULL,
+                    item_id TEXT NOT NULL, item_json TEXT NOT NULL, item_type TEXT NOT NULL,
+                    PRIMARY KEY (thread_id, turn_id, item_id));
+                 INSERT INTO thread_items VALUES ('target-id', 't', 'i', '{\"x\":1}', 'userMessage');
+                 INSERT INTO thread_items VALUES ('keep-id', 't', 'i', '{\"x\":2}', 'userMessage');",
+            )
+            .expect("建表");
+        root
+    }
+
+    fn codex_session(root: &Path, id: &str, path: PathBuf) -> Session {
+        Session {
+            client: Client::Codex,
+            id: id.to_string(),
+            title: "测试会话".to_string(),
+            preview: String::new(),
+            path,
+            root: root.to_path_buf(),
+            cwd: Some("/work".to_string()),
+            workspace: None,
+            created: None,
+            updated: None,
+            bytes: 9,
+            messages: 1,
+            tokens: None,
+            cost: None,
+            locked: false,
+            bili: None,
+            magic: None,
+        }
+    }
+
+    #[test]
+    fn deletes_codex_session_from_the_database() {
+        let scratch = Scratch::new("delete-codex-db");
+        let root = codex_db_fixture(&scratch);
+        // 新版本里 rollout 文件已经不在了，只剩库里的记录。
+        let session = codex_session(&root, "target-id", root.join("sessions").join("gone.jsonl"));
+
+        let outcome = delete(&session).expect("删除");
+        assert_eq!(outcome.bytes, 7, "释放量按 thread_items 的正文大小算");
+
+        let state = Connection::open(root.join("state_5.sqlite")).expect("打开 state 库");
+        let left: i64 = state
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'target-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("计数");
+        assert_eq!(left, 0);
+        let keep: i64 = state
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'keep-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("计数");
+        assert_eq!(keep, 1, "别的会话不受影响");
+        let history = Connection::open(root.join("thread_history_1.sqlite")).expect("打开历史库");
+        let items: i64 = history
+            .query_row(
+                "SELECT COUNT(*) FROM thread_items WHERE thread_id = 'target-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("计数");
+        assert_eq!(items, 0);
+    }
+
+    #[test]
+    fn deletes_codex_rollout_file_and_database_rows_together() {
+        let scratch = Scratch::new("delete-codex-file");
+        let root = codex_db_fixture(&scratch);
+        let file = root
+            .join("sessions")
+            .join("rollout-2026-01-01T00-00-00-target-id.jsonl");
+        fs::write(&file, vec![1u8; 64]).expect("写 rollout");
+        let session = codex_session(&root, "target-id", file.clone());
+
+        let outcome = delete(&session).expect("删除");
+        assert!(!file.exists());
+        assert_eq!(outcome.bytes, 64 + 7);
+        let state = Connection::open(root.join("state_5.sqlite")).expect("打开");
+        let left: i64 = state
+            .query_row(
+                "SELECT COUNT(*) FROM threads WHERE id = 'target-id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("计数");
+        assert_eq!(left, 0);
+    }
+
+    #[test]
+    fn rejects_missing_codex_session() {
+        let scratch = Scratch::new("delete-codex-missing");
+        let root = codex_db_fixture(&scratch);
+        let session = codex_session(
+            &root,
+            "unknown-id",
+            root.join("sessions").join("gone.jsonl"),
+        );
+        let error = match delete(&session) {
+            Ok(_) => panic!("应该拒绝删除"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("没有找到"), "{error}");
     }
 
     #[test]

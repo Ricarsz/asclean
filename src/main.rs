@@ -5,6 +5,7 @@
 mod app;
 mod bili;
 mod cli;
+mod codex;
 mod config;
 mod delete;
 mod magic;
