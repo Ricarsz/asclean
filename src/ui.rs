@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use crate::app::{App, Confirm, Row};
+use crate::app::{App, Confirm, ConfirmTarget, Row};
 use crate::model::{Client, Session, WorkspaceGroup};
 use crate::theme::Palette;
 use crate::util;
@@ -70,7 +70,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
 
     let mut title = vec![
         Span::styled(
-            " SessTui ",
+            " asclean ",
             Style::default()
                 .fg(palette.surface)
                 .bg(palette.accent)
@@ -287,7 +287,9 @@ fn session_line(
     };
     let time = format!("{}  ", session.time_label());
     let badge = badge_text(session.client);
-    let flag = if session.bili.is_some() || session.magic.is_some() {
+    let flag = if session.subagent {
+        "子 "
+    } else if session.bili.is_some() || session.magic.is_some() {
         "• "
     } else {
         "  "
@@ -325,6 +327,7 @@ fn session_line(
 }
 
 fn draw_details(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
+    app.detail_area = area;
     let block = panel(" 详情 ", palette);
     let inner = block.inner(area);
     let lines = app.details();
@@ -394,6 +397,19 @@ impl App {
         ]));
         lines.push(kv(palette, "标题", session.title.clone()));
         lines.push(kv(palette, "标识", session.id.clone()));
+        if session.subagent {
+            let text = match &session.parent {
+                Some(parent) => format!("子会话 · 父 {parent}"),
+                None => "子会话".to_string(),
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {}  ", pad("来源", 8)),
+                    Style::default().fg(palette.dim),
+                ),
+                Span::styled(text, Style::default().fg(palette.warn)),
+            ]));
+        }
         if let Some(cwd) = &session.cwd {
             lines.push(kv(palette, "工作目录", cwd.clone()));
         }
@@ -678,6 +694,7 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
         "空格 勾选",
         "a 全选",
         "d 删除",
+        "X 清理残留",
         "Tab 客户端",
         "/ 过滤",
         "r 重扫",
@@ -706,7 +723,80 @@ fn draw_keys(frame: &mut Frame, app: &App, area: Rect, palette: Palette) {
     );
 }
 
+/// 清理残留的确认框：数字来自 `gc::run(true)` 的演练结果。
+fn draw_cleanup_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    report: &crate::gc::GcReport,
+    palette: Palette,
+) {
+    let mut body = vec![
+        Line::from(Span::styled(
+            "清理已删除会话留下的残留记录：",
+            Style::default().fg(palette.text),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("  工作区登记        {} 条", report.registry),
+            Style::default().fg(palette.text),
+        )),
+        Line::from(Span::styled(
+            format!("  渲染缓存          {} 个", report.projcache),
+            Style::default().fg(palette.text),
+        )),
+        Line::from(Span::styled(
+            format!(
+                "  billion-context   {} 条（{}）",
+                report.bili_records,
+                util::human_bytes(report.bili_bytes)
+            ),
+            Style::default().fg(palette.text),
+        )),
+    ];
+    for warning in report.warnings.iter().take(3) {
+        body.push(Line::from(Span::styled(
+            format!("  注意：{warning}"),
+            Style::default().fg(palette.warn),
+        )));
+    }
+    body.push(Line::from(""));
+    body.push(Line::from(Span::styled(
+        "只动索引与记录，不会删除仍在的会话；删除后不可恢复。",
+        Style::default().fg(palette.dim),
+    )));
+
+    let width = 58u16.min(area.width.saturating_sub(4));
+    let height = (body.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let popup = centered(area, width, height);
+    frame.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .title(Line::from(vec![
+            Span::styled("▍", Style::default().fg(palette.warn)),
+            Span::styled(" 清理残留 ", Style::default().fg(palette.text)),
+        ]))
+        .border_style(Style::default().fg(palette.warn));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [content, footer] =
+        Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(inner);
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().fg(palette.text)),
+        content,
+    );
+    frame.render_widget(
+        Paragraph::new(" Enter / y 清理    Esc / n 取消").style(Style::default().fg(palette.dim)),
+        footer,
+    );
+}
+
 fn draw_confirm(frame: &mut Frame, app: &App, area: Rect, modal: &Confirm, palette: Palette) {
+    if let ConfirmTarget::Cleanup(report) = &modal.target {
+        draw_cleanup_confirm(frame, area, report, palette);
+        return;
+    }
     let sessions: Vec<&Session> = app.confirm_sessions(&modal.target);
     let group = app.confirm_workspace(&modal.target);
     let bytes: u64 = if let Some(group) = group {
@@ -846,9 +936,12 @@ fn draw_help(frame: &mut Frame, app: &mut App, area: Rect, palette: Palette) {
         Line::from("  空格              会话：勾选并下移；工作区：整组勾选 / 取消"),
         Line::from("  a                 全选可见会话 / 取消全选"),
         Line::from("  d                 删除（有勾选删勾选；工作区行删整个工作区）"),
+        Line::from("  X                 清理残留（目录已删，登记/缓存/bili 还留着的记录）"),
         Line::from("  Tab / Shift+Tab   切换客户端视图（全部 → DSH → Codex → Opencode）"),
         Line::from("  /                 按标题、ID、目录、工作区过滤"),
         Line::from("  J / K（详情）     滚动详情（PgUp/PgDn 也行）"),
+        Line::from("  鼠标             左栏滚轮移动光标、点击选中；再点工作区行折叠"),
+        Line::from("                   右栏滚轮翻详情；点空白处不清勾选"),
         Line::from("  r                 立即重新扫描"),
         Line::from("  t                 切换主题"),
         Line::from("  ?                 显示 / 隐藏本帮助"),
@@ -1078,6 +1171,8 @@ mod render_tests {
             cost: Some(0.25),
             locked: false,
             bili: None,
+            subagent: false,
+            parent: None,
             magic: None,
         }
     }
@@ -1189,7 +1284,7 @@ mod render_tests {
             })
             .expect("DSH 会话行");
         let text = render(&mut app, 120, 34);
-        assert!(text.contains("SessTui"), "{text}");
+        assert!(text.contains("asclean"), "{text}");
         assert!(text.contains("清理 DSH 会话"), "{text}");
         assert!(text.contains("验证 OpenCode 接入"), "{text}");
         assert!(text.contains("projects"), "{text}");
@@ -1265,6 +1360,28 @@ mod render_tests {
         assert!(text.contains("删除工作区"), "{text}");
         assert!(text.contains("将删除工作区"), "{text}");
         assert!(text.contains("项目目录不受影响"), "{text}");
+    }
+
+    #[test]
+    fn renders_cleanup_confirm() {
+        let mut app = sample_app();
+        let mut report = crate::gc::GcReport {
+            dry_run: true,
+            ..crate::gc::GcReport::default()
+        };
+        report.registry = 2;
+        report.projcache = 3;
+        report.bili_records = 1;
+        report.bili_bytes = 4096;
+        app.modal = Some(Confirm {
+            target: ConfirmTarget::Cleanup(report),
+            dry_run: false,
+        });
+        let text = render(&mut app, 120, 34);
+        assert!(text.contains("清理残留"), "{text}");
+        assert!(text.contains("工作区登记"), "{text}");
+        assert!(text.contains("billion-context"), "{text}");
+        assert!(text.contains("不会删除仍在的会话"), "{text}");
     }
 
     #[test]

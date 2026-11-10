@@ -83,6 +83,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "asclean"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "ratatui",
+ "rusqlite",
+ "ruzstd",
+ "serde",
+ "serde_json",
+ "toml",
+ "unicode-width",
+]
+
+[[package]]
 name = "atomic"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1397,22 +1413,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "sesstui"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "ratatui",
- "rusqlite",
- "ruzstd",
- "serde",
- "serde_json",
- "toml",
- "unicode-width",
 ]
 
 [[package]]

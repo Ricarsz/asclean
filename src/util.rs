@@ -192,6 +192,34 @@ pub fn system_time_from_millis(millis: i64) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_millis(millis as u64))
 }
 
+/// DSH 会话标识的裸形式：老版本目录名与记录里的 `id` 都是裸 UUID，
+/// 新版本带 `session-` 前缀，工作区登记表里两种写法混着出现。
+pub fn dsh_core(id: &str) -> &str {
+    id.strip_prefix("session-").unwrap_or(id)
+}
+
+/// 两个 DSH 标识是否指同一个会话（忽略 `session-` 前缀差异）。
+pub fn dsh_same_id(a: &str, b: &str) -> bool {
+    dsh_core(a) == dsh_core(b)
+}
+
+/// 是否像 DSH 会话标识：`<uuid>` 或 `session-<uuid>`。
+///
+/// 用来把「DSH 会话」与 billion-context 里别的客户端记的杂项
+/// （例如 `dsh-pet`）区分开，清理残留时只认这种形状。
+pub fn looks_like_dsh_id(id: &str) -> bool {
+    let core = dsh_core(id);
+    let bytes = core.as_bytes();
+    if core.len() != 36 {
+        return false;
+    }
+    let dashes_ok = [8usize, 13, 18, 23]
+        .iter()
+        .all(|index| bytes.get(*index) == Some(&b'-'));
+    let charset_ok = core.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-');
+    dashes_ok && charset_ok
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,5 +252,20 @@ mod tests {
         assert_eq!(path_title("/home/user/projects/"), "projects");
         assert_eq!(path_title("/"), "/");
         assert_eq!(path_title(""), "(未知路径)");
+    }
+
+    #[test]
+    fn recognises_dsh_session_ids() {
+        assert!(looks_like_dsh_id("d5f700e1-2818-403a-bca9-6fbe99806eaf"));
+        assert!(looks_like_dsh_id(
+            "session-d5f700e1-2818-403a-bca9-6fbe99806eaf"
+        ));
+        assert!(!looks_like_dsh_id("dsh-pet"));
+        assert!(!looks_like_dsh_id("session-not-a-uuid"));
+        assert!(!looks_like_dsh_id("--home-ricarse--"));
+        assert_eq!(dsh_core("session-abc"), "abc");
+        assert_eq!(dsh_core("abc"), "abc");
+        assert!(dsh_same_id("abc", "session-abc"));
+        assert!(!dsh_same_id("abc", "abd"));
     }
 }

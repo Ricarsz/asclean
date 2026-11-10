@@ -18,7 +18,7 @@ use crate::util;
 
 #[derive(Parser)]
 #[command(
-    name = "sesstui",
+    name = "asclean",
     version,
     about = "浏览、筛选与删除本机 AI 编码客户端的会话",
     long_about = "扫描 DeepSeek Harness、Codex、Opencode 的会话存储，列出会话并在终端里\
@@ -72,6 +72,13 @@ pub enum Cmd {
         #[arg(long)]
         client: Option<String>,
     },
+    /// 清理残留：会话目录已删，但工作区登记、渲染缓存或
+    /// billion-context 记录里还留着的条目
+    Gc {
+        /// 只统计，不删除
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// 检查扫描到的存储位置、数据库与依赖
     Doctor,
     /// 打印扫描路径
@@ -108,6 +115,7 @@ fn dispatch(command: Cmd, json: bool) -> Result<()> {
             dry_run,
             client,
         } => delete_workspace_cmd(&specs, dry_run, client.as_deref(), json),
+        Cmd::Gc { dry_run } => gc_cmd(dry_run, json),
         Cmd::Doctor => doctor(),
         Cmd::Paths => paths(json),
         Cmd::Config { init, force } => config_cmd(init, force, json),
@@ -200,7 +208,7 @@ fn list(client: Option<&str>, workspace: Option<&str>, json: bool) -> Result<()>
         if let Some(group) = &workspace {
             println!("工作区「{}」下没有会话。", group.title());
         } else {
-            println!("没有找到会话。用 `sesstui doctor` 检查扫描路径。");
+            println!("没有找到会话。用 `asclean doctor` 检查扫描路径。");
         }
         return Ok(());
     }
@@ -265,7 +273,7 @@ fn workspaces_cmd(client: Option<&str>, json: bool) -> Result<()> {
     }
 
     if groups.is_empty() {
-        println!("没有找到工作区。用 `sesstui doctor` 检查扫描路径。");
+        println!("没有找到工作区。用 `asclean doctor` 检查扫描路径。");
         return Ok(());
     }
 
@@ -486,7 +494,7 @@ fn resolve_workspace(groups: &[WorkspaceGroup], spec: &str) -> Result<WorkspaceG
         .filter(|group| group.matches_spec(text))
         .collect();
     match matches.len() {
-        0 => bail!("没有找到工作区：{spec}（用 `sesstui workspaces` 查看可用项）"),
+        0 => bail!("没有找到工作区：{spec}（用 `asclean workspaces` 查看可用项）"),
         1 => Ok(matches[0].clone()),
         _ => bail!(
             "{spec} 匹配到多个工作区，请用完整路径或标识（{}）",
@@ -507,7 +515,7 @@ fn delete_workspace_cmd(
 ) -> Result<()> {
     let client = client.map(parse_client).transpose()?;
     if specs.is_empty() {
-        bail!("请给出至少一个工作区（标识、路径或标题；用 `sesstui workspaces` 查看）");
+        bail!("请给出至少一个工作区（标识、路径或标题；用 `asclean workspaces` 查看）");
     }
     let snapshot = scan::scan();
     let groups = workspace_groups(&snapshot, client);
@@ -680,6 +688,47 @@ fn delete_cmd(ids: &[String], dry_run: bool, client: Option<&str>, json: bool) -
     Ok(())
 }
 
+fn gc_cmd(dry_run: bool, json: bool) -> Result<()> {
+    let report = crate::gc::run(dry_run);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "dry_run": report.dry_run,
+                "registry": report.registry,
+                "projcache": report.projcache,
+                "bili_records": report.bili_records,
+                "bili_bytes": report.bili_bytes,
+                "warnings": report.warnings,
+            }))?
+        );
+        return Ok(());
+    }
+    let verb = if dry_run { "可清理" } else { "已清理" };
+    if report.is_empty() {
+        println!("没有发现残留记录，{verb} 0 项。");
+        return Ok(());
+    }
+    println!("{verb}：");
+    println!("  工作区登记  {} 条", report.registry);
+    println!("  渲染缓存    {} 个", report.projcache);
+    println!(
+        "  billion-context  {} 条（{}）",
+        report.bili_records,
+        util::human_bytes(report.bili_bytes)
+    );
+    for warning in &report.warnings {
+        println!("  注意：{warning}");
+    }
+    for sample in &report.samples {
+        println!("  例：{}", util::truncate(sample, 40));
+    }
+    if dry_run {
+        println!("\n去掉 --dry-run 即真正清理。");
+    }
+    Ok(())
+}
+
 fn doctor() -> Result<()> {
     let snapshot = scan::scan();
     println!("扫描结果\n");
@@ -780,7 +829,7 @@ fn doctor() -> Result<()> {
             );
             if summary.orphans > 0 {
                 println!(
-                    "  残留 {} 个：bili 库里还有、DSH 侧已找不到的会话记录（经 SessTui 删除的会话不会留下这种记录）。",
+                    "  残留 {} 个：bili 库里还有、DSH 侧已找不到的会话记录（经 asclean 删除的会话不会留下这种记录）。",
                     summary.orphans
                 );
             }
@@ -820,7 +869,7 @@ fn doctor() -> Result<()> {
             );
             if summary.orphans > 0 {
                 println!(
-                    "  残留 {} 个：magic-context 里还有、opencode 侧已找不到的会话记录（经 SessTui 删除的会话不会留下这种记录）。",
+                    "  残留 {} 个：magic-context 里还有、opencode 侧已找不到的会话记录（经 asclean 删除的会话不会留下这种记录）。",
                     summary.orphans
                 );
             }
@@ -848,7 +897,7 @@ fn which(name: &str) -> Option<std::path::PathBuf> {
 }
 
 fn probe_writable(path: &Path) -> bool {
-    let probe = path.join(".sesstui-probe");
+    let probe = path.join(".asclean-probe");
     match std::fs::File::create(&probe) {
         Ok(_) => {
             let _ = std::fs::remove_file(&probe);

@@ -288,7 +288,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .map(|value| value.as_nanos())
                 .unwrap_or_default();
-            let path = std::env::temp_dir().join(format!("sesstui-codex-{name}-{stamp}"));
+            let path = std::env::temp_dir().join(format!("asclean-codex-{name}-{stamp}"));
             fs::create_dir_all(&path).expect("建目录");
             Self(path)
         }

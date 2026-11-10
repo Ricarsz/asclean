@@ -61,6 +61,8 @@ impl Row {
 pub enum ConfirmTarget {
     Sessions(Vec<usize>),
     Workspace(String),
+    /// 清理残留（会话目录已不在，索引里还留着的记录）。
+    Cleanup(crate::gc::GcReport),
 }
 
 #[derive(Debug, Clone)]
@@ -101,6 +103,7 @@ pub struct App {
     pub dirty: bool,
     pub quitting: bool,
     pub list_area: Rect,
+    pub detail_area: Rect,
     pub list_offset: usize,
     last_scan: Instant,
 }
@@ -138,6 +141,7 @@ impl App {
             dirty: true,
             quitting: false,
             list_area: Rect::default(),
+            detail_area: Rect::default(),
             list_offset: 0,
             last_scan: Instant::now(),
         };
@@ -315,6 +319,7 @@ impl App {
     pub fn confirm_sessions(&self, target: &ConfirmTarget) -> Vec<&Session> {
         let indices: Vec<usize> = match target {
             ConfirmTarget::Sessions(indices) => indices.clone(),
+            ConfirmTarget::Cleanup(_) => Vec::new(),
             ConfirmTarget::Workspace(key) => self
                 .workspaces
                 .iter()
@@ -331,7 +336,7 @@ impl App {
     pub fn confirm_workspace(&self, target: &ConfirmTarget) -> Option<&WorkspaceGroup> {
         match target {
             ConfirmTarget::Workspace(key) => self.workspaces.iter().find(|group| &group.key == key),
-            ConfirmTarget::Sessions(_) => None,
+            ConfirmTarget::Sessions(_) | ConfirmTarget::Cleanup(_) => None,
         }
     }
 
@@ -449,6 +454,53 @@ impl App {
             self.set_notice(NoticeKind::Info, format!("已勾选 {count} 个会话"));
         }
         self.dirty = true;
+    }
+
+    /// `X`：清理已经没有会话目录、却还留在登记表 / 缓存 / billion-context
+    /// 里的记录。先跑一遍演练，把数字放进确认框。
+    fn request_cleanup(&mut self) {
+        let preview = crate::gc::run(true);
+        if preview.total() == 0 && preview.warnings.is_empty() {
+            self.set_notice(NoticeKind::Ok, "没有残留记录，索引是干净的");
+            return;
+        }
+        self.modal = Some(Confirm {
+            target: ConfirmTarget::Cleanup(preview),
+            dry_run: false,
+        });
+        self.dirty = true;
+    }
+
+    fn apply_cleanup(&mut self, dry_run: bool) {
+        let report = crate::gc::run(dry_run);
+        if dry_run {
+            self.set_notice(
+                NoticeKind::Warn,
+                format!(
+                    "演练：将清理 {} 项，释放 {}",
+                    report.total(),
+                    util::human_bytes(report.bili_bytes)
+                ),
+            );
+            return;
+        }
+        self.reload();
+        let warning = report.warnings.first().cloned();
+        let text = format!(
+            "已清理 {} 项（登记 {} · 缓存 {} · bili {} 条 {}）",
+            report.total(),
+            report.registry,
+            report.projcache,
+            report.bili_records,
+            util::human_bytes(report.bili_bytes)
+        );
+        match warning {
+            Some(warning) => self.set_notice(NoticeKind::Warn, format!("{text} · {warning}")),
+            None if report.total() == 0 => {
+                self.set_notice(NoticeKind::Info, "没有发现残留记录");
+            }
+            None => self.set_notice(NoticeKind::Ok, text),
+        }
     }
 
     fn request_delete(&mut self) {
@@ -766,6 +818,7 @@ impl App {
             KeyCode::Char(' ') => self.toggle_mark(),
             KeyCode::Char('a') => self.mark_all(),
             KeyCode::Char('d') => self.request_delete(),
+            KeyCode::Char('X') => self.request_cleanup(),
             _ => {}
         }
     }
@@ -815,6 +868,10 @@ impl App {
                     ConfirmTarget::Workspace(key) => {
                         self.apply_workspace_delete(&key, modal.dry_run)
                     }
+                    ConfirmTarget::Cleanup(report) => {
+                        let _ = report;
+                        self.apply_cleanup(false);
+                    }
                 }
             }
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Char('q') => {
@@ -845,12 +902,27 @@ impl App {
     }
 
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        let in_list = |area: Rect| {
+            mouse.column >= area.x
+                && mouse.column < area.x + area.width
+                && mouse.row > area.y
+                && mouse.row < area.y + area.height
+        };
         match mouse.kind {
+            // 滚轮在左边列表上滚动就是移动光标，在右边详情上才是翻详情。
             MouseEventKind::ScrollDown => {
-                self.detail_scroll = self.detail_scroll.saturating_add(1);
+                if in_list(self.list_area) {
+                    self.move_by(1);
+                } else {
+                    self.detail_scroll = self.detail_scroll.saturating_add(1);
+                }
             }
             MouseEventKind::ScrollUp => {
-                self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                if in_list(self.list_area) {
+                    self.move_by(-1);
+                } else {
+                    self.detail_scroll = self.detail_scroll.saturating_sub(1);
+                }
             }
             MouseEventKind::Down(MouseButton::Left) => {
                 let area = self.list_area;
@@ -863,9 +935,14 @@ impl App {
                 }
                 let row = (mouse.row - area.y - 1) as usize + self.list_offset;
                 if row < self.rows.len() {
+                    let same = row == self.selected;
                     self.selected = row;
                     self.detail_scroll = 0;
                     self.dirty = true;
+                    // 再点一次已选中的工作区行 = 折叠 / 展开，省得去够 h/l。
+                    if same && matches!(self.current_row(), Some(Row::Workspace { .. })) {
+                        self.toggle_group();
+                    }
                 }
             }
             _ => {}
@@ -975,6 +1052,8 @@ mod tests {
             cost: None,
             locked: false,
             bili: None,
+            subagent: false,
+            parent: None,
             magic: None,
         }
     }

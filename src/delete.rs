@@ -1,5 +1,6 @@
 //! 删除：按客户端各自的存储方式清理，并做路径与锁的安全检查。
 
+use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -80,11 +81,7 @@ fn delete_dsh(session: &Session) -> Result<Outcome> {
     let dir = &session.path;
     let allowed = session.root.join("sessions");
     ensure_inside(dir, &allowed)?;
-    if !dir
-        .file_name()
-        .map(|name| name.to_string_lossy().starts_with("session-"))
-        .unwrap_or(false)
-    {
+    if !dsh_session_dir(dir) {
         bail!("不是会话目录：{}", dir.display());
     }
     if util::lock_held(&dir.join("session.lock")) {
@@ -93,6 +90,8 @@ fn delete_dsh(session: &Session) -> Result<Outcome> {
     let bytes = util::dir_size(dir);
     fs::remove_dir_all(dir).with_context(|| format!("删除 {}", dir.display()))?;
     drop_dsh_projcache(&session.root, &session.id);
+    // 工作区登记表里还挂着这个会话 id，留着会让 TUI / doctor 一直看到“登记了但目录没了”。
+    let deregistered = deregister_dsh_session(&session.root, &session.id).is_ok();
     // 工作区目录空了就一并收掉，避免残留空壳。
     if let Some(parent) = dir.parent()
         && let Ok(mut entries) = fs::read_dir(parent)
@@ -103,6 +102,9 @@ fn delete_dsh(session: &Session) -> Result<Outcome> {
     // billion-context 用同一个会话 id 记账；DSH 删掉后一起清，避免留下孤儿。
     let mut warnings = Vec::new();
     let mut bytes = bytes;
+    if !deregistered {
+        warnings.push("工作区登记表没更新，可能被其他进程占用".to_string());
+    }
     if let Some(meta) = &session.bili {
         match crate::bili::delete_session(&meta.db, &session.id) {
             Ok(extra) => bytes += extra,
@@ -201,7 +203,7 @@ fn delete_opencode(session: &Session) -> Result<Outcome> {
         bail!("数据库里没有该会话，可能已被删除");
     }
     // magic-context 用同一个会话 id 记账；它在 opencode 里收到删除事件才
-    // 会自己清，SessTui 直接改库不产生事件，所以这里补一刀。
+    // 会自己清，asclean 直接改库不产生事件，所以这里补一刀。
     let mut warnings = Vec::new();
     if let Some(meta) = &session.magic
         && let Err(error) = crate::magic::delete_session(&meta.db, &session.id)
@@ -294,14 +296,157 @@ pub fn delete_workspace(
     report
 }
 
+/// 会话目录的判据：目录名是 `session-<uuid>` 或裸 `<uuid>`（老版本 DSH），
+/// 或者目录里躺着会话日志 / 锁文件。只看名字会把老会话全都拒掉。
+fn dsh_session_dir(dir: &Path) -> bool {
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if util::looks_like_dsh_id(&name) {
+        return true;
+    }
+    fs::read_dir(dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                let file = entry.file_name().to_string_lossy().to_string();
+                file == "session.lock" || (file.starts_with("session") && file.contains(".jsonl"))
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// DSH 为每个会话缓存一份渲染状态，删会话后一并清掉，避免留下孤儿文件。
 fn drop_dsh_projcache(root: &Path, id: &str) {
-    let cache = root
+    let sessions = root
         .join("storages")
         .join("session_projcache")
-        .join("sessions")
-        .join(format!("{id}.json"));
-    let _ = fs::remove_file(cache);
+        .join("sessions");
+    for candidate in [id.to_string(), format!("session-{}", util::dsh_core(id))] {
+        let _ = fs::remove_file(sessions.join(format!("{candidate}.json")));
+    }
+}
+
+/// 从 `storages/workspace.json` 的所有 `sessionIds` 与全局收藏/归档列表里
+/// 摘掉一个会话；`session-` 前缀的写法差异一并抹平。
+pub fn deregister_dsh_session(root: &Path, id: &str) -> Result<bool> {
+    let (removed, _) = prune_registry_with(root, &|candidate| !util::dsh_same_id(candidate, id))?;
+    Ok(removed > 0)
+}
+
+/// 登记表里已经没有对应目录的会话 id（不落盘，供清理预览用）。
+pub fn dangling_registry(root: &Path, present: &HashSet<String>) -> Result<Vec<String>> {
+    let path = root.join("storages").join("workspace.json");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path).with_context(|| format!("读取 {}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("解析 {}", path.display()))?;
+    let mut out = Vec::new();
+    collect_registry_ids(&value, &mut out);
+    out.retain(|id| is_dangling(id, present));
+    Ok(out)
+}
+
+/// 把登记表里没有对应目录的会话 id 全部摘掉，返回摘掉的条数。
+pub fn prune_registry(root: &Path, present: &HashSet<String>) -> Result<usize> {
+    let (removed, _) = prune_registry_with(root, &|id| !is_dangling(id, present))?;
+    Ok(removed)
+}
+
+/// 只认 DSH 形状的 id：`dsh-pet` 之类别的客户端记录一律不动。
+fn is_dangling(id: &str, present: &HashSet<String>) -> bool {
+    util::looks_like_dsh_id(id) && !present.contains(util::dsh_core(id))
+}
+
+fn collect_registry_ids(value: &serde_json::Value, out: &mut Vec<String>) {
+    if let Some(table) = value
+        .pointer("/tables/workspaces")
+        .and_then(serde_json::Value::as_object)
+    {
+        for record in table.values() {
+            if let Some(ids) = record
+                .get("sessionIds")
+                .and_then(serde_json::Value::as_array)
+            {
+                out.extend(
+                    ids.iter()
+                        .filter_map(|item| item.as_str())
+                        .map(str::to_string),
+                );
+            }
+        }
+    }
+    if let Some(global) = value
+        .pointer("/global")
+        .and_then(serde_json::Value::as_object)
+    {
+        for key in ["archivedSessionIds", "pinnedSessionIds"] {
+            if let Some(ids) = global.get(key).and_then(serde_json::Value::as_array) {
+                out.extend(
+                    ids.iter()
+                        .filter_map(|item| item.as_str())
+                        .map(str::to_string),
+                );
+            }
+        }
+    }
+}
+
+/// 按 `keep` 逐条过滤登记表里的会话 id，返回（摘掉的条数, 摘掉的 id）。
+fn prune_registry_with(root: &Path, keep: &dyn Fn(&str) -> bool) -> Result<(usize, Vec<String>)> {
+    let path = root.join("storages").join("workspace.json");
+    if !path.is_file() {
+        return Ok((0, Vec::new()));
+    }
+    let text = fs::read_to_string(&path).with_context(|| format!("读取 {}", path.display()))?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&text).with_context(|| format!("解析 {}", path.display()))?;
+    let mut removed: Vec<String> = Vec::new();
+    if let Some(table) = value
+        .pointer_mut("/tables/workspaces")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for record in table.values_mut() {
+            if let Some(ids) = record
+                .get_mut("sessionIds")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                ids.retain(|item| match item.as_str() {
+                    Some(id) if !keep(id) => {
+                        removed.push(id.to_string());
+                        false
+                    }
+                    _ => true,
+                });
+            }
+        }
+    }
+    if let Some(global) = value
+        .pointer_mut("/global")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for key in ["archivedSessionIds", "pinnedSessionIds"] {
+            if let Some(ids) = global
+                .get_mut(key)
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                ids.retain(|item| match item.as_str() {
+                    Some(id) if !keep(id) => {
+                        removed.push(id.to_string());
+                        false
+                    }
+                    _ => true,
+                });
+            }
+        }
+    }
+    if removed.is_empty() {
+        return Ok((0, removed));
+    }
+    write_json_atomic(&path, &value)?;
+    Ok((removed.len(), removed))
 }
 
 /// 从 `storages/workspace.json` 里摘掉一个工作区，并清理指向它的全局列表。
@@ -391,7 +536,10 @@ fn dsh_present_session(root: &Path, session_ids: &[String]) -> Option<String> {
         };
         for entry in sessions.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if session_ids.contains(&name) {
+            if session_ids
+                .iter()
+                .any(|candidate| util::dsh_same_id(candidate, &name))
+            {
                 return Some(name);
             }
         }
@@ -471,7 +619,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .map(|value| value.as_nanos())
                 .unwrap_or_default();
-            let path = std::env::temp_dir().join(format!("sesstui-{name}-{stamp}"));
+            let path = std::env::temp_dir().join(format!("asclean-{name}-{stamp}"));
             fs::create_dir_all(&path).expect("建目录");
             Self(path)
         }
@@ -547,6 +695,8 @@ mod tests {
                 updated: None,
                 status: "active".to_string(),
             }),
+            subagent: false,
+            parent: None,
             magic: None,
         }
     }
@@ -598,6 +748,8 @@ mod tests {
             cost: None,
             locked: false,
             bili: None,
+            subagent: false,
+            parent: None,
             magic: None,
         }
     }
@@ -790,6 +942,8 @@ mod tests {
             tokens: None,
             cost: None,
             locked: false,
+            subagent: false,
+            parent: None,
             bili: None,
             magic: Some(MagicMeta {
                 db: magic,

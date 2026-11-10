@@ -1,6 +1,6 @@
 [package]
-name = "sesstui"
-version = "0.5.0"
+name = "asclean"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.88"
 description = "浏览、筛选与删除本机 AI 编码客户端的会话"
@@ -19,7 +19,7 @@ toml = "0.8"
 unicode-width = "0.2"
 
 [[bin]]
-name = "sesstui"
+name = "asclean"
 path = "src/main.rs"
 
 [profile.release]

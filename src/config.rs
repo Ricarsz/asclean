@@ -1,4 +1,4 @@
-//! `~/.config/sesstui/config.toml`，缺失时全部使用默认值。
+//! `~/.config/asclean/config.toml`，缺失时全部使用默认值。
 
 use std::env;
 use std::fs;
@@ -32,14 +32,23 @@ impl Default for Config {
     }
 }
 
+fn config_dir() -> PathBuf {
+    env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"))
+}
+
 impl Config {
     pub fn path() -> PathBuf {
-        let base = env::var_os("XDG_CONFIG_HOME")
-            .map(PathBuf::from)
-            .filter(|path| !path.as_os_str().is_empty())
-            .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-            .unwrap_or_else(|| PathBuf::from(".config"));
-        base.join("sesstui").join("config.toml")
+        config_dir().join("asclean").join("config.toml")
+    }
+
+    /// 改名前的配置路径 `~/.config/sesstui/config.toml`：只读兜底，
+    /// 免得老用户的设置静默失效；写入永远走新路径。
+    fn legacy_path() -> PathBuf {
+        config_dir().join("sesstui").join("config.toml")
     }
 
     /// 写入默认配置；已存在时只有 `force` 才覆盖。
@@ -57,9 +66,14 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        let path = Self::path();
+        let mut path = Self::path();
         if !path.exists() {
-            return Ok(Self::default());
+            let legacy = Self::legacy_path();
+            if legacy.exists() {
+                path = legacy;
+            } else {
+                return Ok(Self::default());
+            }
         }
         let text =
             fs::read_to_string(&path).with_context(|| format!("读取配置 {}", path.display()))?;

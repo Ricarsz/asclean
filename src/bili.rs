@@ -4,7 +4,7 @@
 //! 与 DSH 的会话目录同名，所以能按 id 一一对应。这里只读写这个数据库，
 //! 不碰日志、证书与代理进程。
 //!
-//! 数据根默认是 `~/.local/share/billion-context`，可用 `SESSTUI_BILI_DIR`
+//! 数据根默认是 `~/.local/share/billion-context`，可用 `ASCLEAN_BILI_DIR`
 //! 覆盖（多个用 `:` 分隔，指向数据根或 `index.db` 都行）。
 
 use std::collections::HashSet;
@@ -19,7 +19,7 @@ use crate::model::{BiliMeta, Client, Session};
 use crate::util;
 
 /// 覆盖 bili 数据根目录。
-pub const ENV_DIR: &str = "SESSTUI_BILI_DIR";
+pub const ENV_DIR: &str = "ASCLEAN_BILI_DIR";
 
 /// 会随会话一起删除的表；bili 没给这些表加外键，只能手工清理。
 const OWNED_TABLES: [&str; 10] = [
@@ -134,6 +134,57 @@ pub fn attach(sessions: &mut [Session]) -> Option<Summary> {
     }
     summary.linked = linked.len();
     Some(summary)
+}
+
+/// bili 数据库里的一条会话记录（轻量视图，用于找残留）。
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub id: String,
+    /// 代理实例命名空间，DSH 写的是 `dsh`。
+    pub namespace: String,
+    pub title: String,
+}
+
+/// 读取 bili 数据库里的会话清单。
+pub fn entries(db: &Path) -> Result<Vec<Entry>> {
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("打开 {}", db.display()))?;
+    conn.busy_timeout(Duration::from_secs(1))?;
+    let mut stmt = conn
+        .prepare("SELECT session_id, namespace, COALESCE(title, '') FROM sessions")
+        .with_context(|| format!("读取 {}", db.display()))?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+    Ok(rows
+        .into_iter()
+        .map(|(id, namespace, title)| Entry {
+            id,
+            namespace,
+            title,
+        })
+        .collect())
+}
+
+/// 某个会话在 bili 里占的字节数（只读，不删）。
+pub fn bytes_of(db: &Path, id: &str) -> Result<u64> {
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .with_context(|| format!("打开 {}", db.display()))?;
+    conn.busy_timeout(Duration::from_secs(1))?;
+    session_bytes(&conn, id)
 }
 
 fn load(db: &Path) -> Result<Vec<(String, BiliMeta)>> {
@@ -254,7 +305,8 @@ pub fn delete_session(db: &Path, id: &str) -> Result<u64> {
         bail!("数据库不存在：{}", db.display());
     }
     let mut conn = Connection::open(db).with_context(|| format!("打开 {}", db.display()))?;
-    conn.busy_timeout(Duration::from_secs(3))?;
+    // 代理进程一直在写这份库，给它一点让路的时间再判失败。
+    conn.busy_timeout(Duration::from_secs(5))?;
     let tx = conn.transaction()?;
     let bytes = session_bytes(&tx, id)?;
     let hashes = session_hashes(&tx, id)?;
@@ -308,7 +360,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .map(|value| value.as_nanos())
                 .unwrap_or_default();
-            let path = env::temp_dir().join(format!("sesstui-{name}-{stamp}"));
+            let path = env::temp_dir().join(format!("asclean-{name}-{stamp}"));
             std::fs::create_dir_all(&path).expect("建目录");
             Self(path)
         }

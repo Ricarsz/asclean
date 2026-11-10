@@ -5,10 +5,10 @@
 //! opencode 的会话 id（`ses_...`），所以能按 id 一一对应。
 //!
 //! 数据根默认是 `~/.local/share/cortexkit/magic-context`，可用
-//! `SESSTUI_MAGIC_DIR` 覆盖（多个用 `:` 分隔，指向数据根或 `context.db`）。
+//! `ASCLEAN_MAGIC_DIR` 覆盖（多个用 `:` 分隔，指向数据根或 `context.db`）。
 //!
 //! 插件自己在 opencode 里收到 `session.deleted` 事件时会清理这些行；
-//! SessTui 直接删 opencode.db 的记录不产生事件，所以要在这里补一刀。
+//! asclean 直接删 opencode.db 的记录不产生事件，所以要在这里补一刀。
 
 use std::collections::HashSet;
 use std::env;
@@ -22,7 +22,7 @@ use crate::model::{Client, MagicMeta, Session};
 use crate::util;
 
 /// 覆盖 magic-context 数据根目录。
-pub const ENV_DIR: &str = "SESSTUI_MAGIC_DIR";
+pub const ENV_DIR: &str = "ASCLEAN_MAGIC_DIR";
 
 /// magic-context 存储的总体情况，供 doctor 与界面提示使用。
 #[derive(Debug, Default, Clone)]
@@ -255,7 +255,7 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .map(|value| value.as_nanos())
                 .unwrap_or_default();
-            let path = env::temp_dir().join(format!("sesstui-{name}-{stamp}"));
+            let path = env::temp_dir().join(format!("asclean-{name}-{stamp}"));
             std::fs::create_dir_all(&path).expect("建目录");
             Self(path)
         }

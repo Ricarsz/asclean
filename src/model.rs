@@ -149,6 +149,10 @@ pub struct Session {
     pub tokens: Option<(u64, u64)>,
     pub cost: Option<f64>,
     pub locked: bool,
+    /// DSH 的子会话（由某个父会话派生，`origin: subagent`）。
+    pub subagent: bool,
+    /// 子会话的父会话标识。
+    pub parent: Option<String>,
     /// billion-context 侧的同一会话；没接入或没数据时为空。
     pub bili: Option<BiliMeta>,
     /// magic-context 侧的同一会话；没接入或没数据时为空。
@@ -391,6 +395,8 @@ mod tests {
             cost: None,
             locked: false,
             bili: None,
+            subagent: false,
+            parent: None,
             magic: None,
         }
     }

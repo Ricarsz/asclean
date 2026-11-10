@@ -5,7 +5,7 @@
 //!   `~/.codex*/state_<n>.sqlite` 里的会话记录（见 [`crate::codex`]）
 //! - Opencode：`~/.local/share/opencode/opencode.db`（SQLite）
 //!
-//! 目录位置可由 `SESSTUI_DSH_ROOT` / `SESSTUI_CODEX_HOME` / `SESSTUI_OPENCODE_DIR`
+//! 目录位置可由 `ASCLEAN_DSH_ROOT` / `ASCLEAN_CODEX_HOME` / `ASCLEAN_OPENCODE_DIR`
 //! 覆盖，多个路径用 `:` 分隔，便于扫描代理版等独立实例。
 
 use std::collections::{HashMap, HashSet};
@@ -91,6 +91,7 @@ pub fn scan() -> Snapshot {
     scan_dsh(&mut snapshot);
     scan_codex(&mut snapshot);
     scan_opencode(&mut snapshot);
+    inherit_subagent_workspaces(&mut snapshot.sessions);
     snapshot.sessions.sort_by(|a, b| {
         b.updated_or_epoch()
             .cmp(&a.updated_or_epoch())
@@ -191,6 +192,13 @@ impl DshWorkspaces {
         self.all.iter().find(|workspace| workspace.id == id)
     }
 
+    /// 会话归属的工作区；`id` 带不带 `session-` 前缀都能查。
+    fn owner_of(&self, id: &str) -> Option<&Workspace> {
+        self.session_owner
+            .get(util::dsh_core(id))
+            .and_then(|owner| self.by_id(owner))
+    }
+
     fn by_path(&self, path: &str) -> Option<&Workspace> {
         self.all
             .iter()
@@ -236,7 +244,9 @@ fn parse_dsh_workspaces(value: &Value, root: &Path) -> DshWorkspaces {
             .flatten()
             .filter_map(Value::as_str)
         {
-            out.session_owner.insert(session_id.to_string(), id.clone());
+            // 老版本登记成裸 UUID，新版本带 `session-` 前缀，统一按裸 id 存。
+            out.session_owner
+                .insert(util::dsh_core(session_id).to_string(), id.clone());
         }
         out.all.push(Workspace {
             client: Client::Dsh,
@@ -254,8 +264,51 @@ fn same_path(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
+/// 本机所有 DSH 存储根：默认位置 + 环境变量覆盖的位置。
+///
+/// 清理残留时必须用它，而不是当前扫描范围 —— 否则 `ASCLEAN_DSH_ROOT`
+/// 指到别处时，真实会话会被当成“目录不存在”而误删 bili 记录。
+pub fn all_dsh_roots() -> Vec<PathBuf> {
+    let mut roots = sibling_roots(".dsh");
+    for root in env_roots("ASCLEAN_DSH_ROOT") {
+        if !roots.iter().any(|known| known == &root) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+/// 所有 DSH 会话目录的裸 id（只读目录名，不解析内容）。
+pub fn dsh_session_dirs() -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    for root in all_dsh_roots() {
+        let Ok(entries) = fs::read_dir(root.join("sessions")) else {
+            continue;
+        };
+        for slug in entries.flatten() {
+            if !slug.path().is_dir() {
+                continue;
+            }
+            let Ok(sessions) = fs::read_dir(slug.path()) else {
+                continue;
+            };
+            for session in sessions.flatten() {
+                let path = session.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let name = session.file_name().to_string_lossy().to_string();
+                if util::looks_like_dsh_id(&name) {
+                    out.push((util::dsh_core(&name).to_string(), path));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn scan_dsh(snapshot: &mut Snapshot) {
-    let mut roots = env_roots("SESSTUI_DSH_ROOT");
+    let mut roots = env_roots("ASCLEAN_DSH_ROOT");
     if roots.is_empty() {
         roots = sibling_roots(".dsh");
     }
@@ -344,6 +397,8 @@ fn load_dsh_session(
     let mut title = String::new();
     let mut preview = String::new();
     let mut messages = 0u32;
+    let mut subagent = false;
+    let mut parent: Option<String> = None;
 
     if let Some(payload) = payload {
         let mut reader = open_maybe_zstd(payload)?;
@@ -370,6 +425,15 @@ fn load_dsh_session(
                         }
                         if cwd.is_none() {
                             cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
+                        }
+                        if value.get("origin").and_then(Value::as_str) == Some("subagent") {
+                            subagent = true;
+                        }
+                        if parent.is_none() {
+                            parent = value
+                                .get("parentSession")
+                                .and_then(Value::as_str)
+                                .map(str::to_string);
                         }
                     }
                     "session/title" => {
@@ -398,13 +462,11 @@ fn load_dsh_session(
     }
 
     if id.is_empty() {
-        // 目录名形如 session-<uuid>。
-        let name = dir.file_name().unwrap_or_default().to_string_lossy();
-        if let Some(rest) = name.strip_prefix("session-") {
-            id = format!("session-{rest}");
-        } else {
-            id = name.to_string();
-        }
+        // 目录名就是会话 id：老版本是裸 UUID，新版本带 `session-` 前缀。
+        id = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_default();
     }
 
     let mut updated = None;
@@ -420,9 +482,7 @@ fn load_dsh_session(
 
     let locked = util::lock_held(&dir.join("session.lock"));
     let workspace = workspaces
-        .session_owner
-        .get(&id)
-        .and_then(|owner| workspaces.by_id(owner))
+        .owner_of(&id)
         .or_else(|| {
             // 登记表里没有这个会话时，按 cwd 找同名工作区，最后退回按目录合成。
             cwd.as_deref().and_then(|cwd| workspaces.by_path(cwd))
@@ -458,9 +518,45 @@ fn load_dsh_session(
         tokens: None,
         cost: None,
         locked,
+        subagent,
+        parent,
         bili: None,
         magic: None,
     }))
+}
+
+/// 子会话跟随父会话的工作区：父会话登记过工作区、自己只能按 cwd 猜时，
+/// 用父会话的归属，避免同一个工作区在树里裂成两行。
+fn inherit_subagent_workspaces(sessions: &mut [Session]) {
+    let mut owners: HashMap<String, Workspace> = HashMap::new();
+    for session in sessions.iter() {
+        if session.client != Client::Dsh {
+            continue;
+        }
+        if let Some(workspace) = &session.workspace {
+            owners
+                .entry(util::dsh_core(&session.id).to_string())
+                .or_insert_with(|| workspace.clone());
+        }
+    }
+    for session in sessions.iter_mut() {
+        if session.client != Client::Dsh || !session.subagent {
+            continue;
+        }
+        if session
+            .workspace
+            .as_ref()
+            .is_some_and(|workspace| !workspace.is_synthetic())
+        {
+            continue;
+        }
+        let Some(parent) = session.parent.as_deref() else {
+            continue;
+        };
+        if let Some(workspace) = owners.get(util::dsh_core(parent)) {
+            session.workspace = Some(workspace.clone());
+        }
+    }
 }
 
 /// 取一条真实用户消息：跳过 runtime context、system-reminder 之类的系统注入。
@@ -605,7 +701,7 @@ impl Read for ZstdReader {
 // ---------------------------------------------------------------- Codex
 
 fn scan_codex(snapshot: &mut Snapshot) {
-    let mut roots = env_roots("SESSTUI_CODEX_HOME");
+    let mut roots = env_roots("ASCLEAN_CODEX_HOME");
     if roots.is_empty() {
         roots = sibling_roots_where(".codex", codex_root);
     }
@@ -718,6 +814,8 @@ fn codex_thread_session(
         cost: None,
         locked: false,
         bili: None,
+        subagent: false,
+        parent: None,
         magic: None,
     }
 }
@@ -865,6 +963,8 @@ fn load_codex_session(
         cost: None,
         locked: false,
         bili: None,
+        subagent: false,
+        parent: None,
         magic: None,
     })
 }
@@ -949,7 +1049,7 @@ mod time_like {
 // ---------------------------------------------------------------- Opencode
 
 fn scan_opencode(snapshot: &mut Snapshot) {
-    let mut roots = env_roots("SESSTUI_OPENCODE_DIR");
+    let mut roots = env_roots("ASCLEAN_OPENCODE_DIR");
     if roots.is_empty() {
         let data = env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
@@ -1101,6 +1201,8 @@ fn load_opencode_sessions(db: &Path, root: &Path) -> Result<(Vec<Session>, Vec<W
             cost: Some(cost),
             locked: false,
             bili: None,
+            subagent: false,
+            parent: None,
             magic: None,
         });
     }
@@ -1163,11 +1265,13 @@ mod tests {
         });
         let workspaces = parse_dsh_workspaces(&value, Path::new("/root"));
         assert_eq!(workspaces.all.len(), 2);
+        // 登记表里的 id 带 `session-` 前缀，键统一存裸 id。
         assert_eq!(
-            workspaces
-                .session_owner
-                .get("session-a")
-                .map(String::as_str),
+            workspaces.session_owner.get("a").map(String::as_str),
+            Some("ws-1")
+        );
+        assert_eq!(
+            workspaces.owner_of("session-a").map(|ws| ws.id.as_str()),
             Some("ws-1")
         );
         let by_path = workspaces.by_path("/work/projects").expect("路径匹配");

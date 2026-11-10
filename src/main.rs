@@ -1,4 +1,4 @@
-//! SessTui — 浏览、筛选与删除本机 AI 编码客户端的会话。
+//! asclean — 浏览、筛选与删除本机 AI 编码客户端的会话。
 
 #![recursion_limit = "256"]
 
@@ -8,6 +8,7 @@ mod cli;
 mod codex;
 mod config;
 mod delete;
+mod gc;
 mod magic;
 mod model;
 mod scan;
